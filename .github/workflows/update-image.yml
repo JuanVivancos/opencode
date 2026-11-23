@@ -1,0 +1,222 @@
+name: Update Docker Image
+
+on:
+  schedule:
+    - cron: '0 3 * * *'     # Cada 24 h, 03:00 UTC (04:00/05:00 en Madrid)
+  workflow_dispatch:          # Lanzamiento manual
+    inputs:
+      force:
+        description: 'Forzar build aunque la versión ya esté publicada'
+        type: boolean
+        default: false
+
+concurrency:
+  group: update-docker-image
+  cancel-in-progress: false
+
+env:
+  NPM_PACKAGE: '@opencode/cli'                         # OpenCode v2 (opencode-ai = v1)
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}   # vacío = no publica en Docker Hub
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      needs_update: ${{ steps.compare.outputs.needs_update }}
+      version: ${{ steps.release.outputs.version }}
+      image: ${{ steps.image.outputs.name }}
+      dockerhub_image: ${{ steps.image.outputs.dockerhub }}
+    steps:
+      - name: Image names
+        id: image
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opencode" >> "$GITHUB_OUTPUT"
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            echo "dockerhub=docker.io/${DOCKERHUB_USERNAME,,}/opencode" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get latest version (npm)
+        id: release
+        run: |
+          VERSION="$(npm view "$NPM_PACKAGE" version)"
+          case "$VERSION" in
+            2.*) ;;
+            *) echo "::error::Versión inesperada '$VERSION' (se esperaba 2.x)"; exit 1 ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get current image version
+        id: current
+        run: |
+          IMAGE="${{ steps.image.outputs.name }}"
+          # --entrypoint evita el entrypoint (auto-update, PUID/PGID) y sus logs
+          read_image_version() {
+            docker run --rm --entrypoint opencode "$IMAGE:$1" --version 2>/dev/null \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -1
+          }
+          TARGET_VERSION="${{ steps.release.outputs.version }}"
+          PUBLISHED_LATEST_VERSION="$(read_image_version latest || true)"
+          PUBLISHED_TARGET_VERSION="$(read_image_version "$TARGET_VERSION" || true)"
+
+          # Docker Hub (si está configurado): ¿existe el tag de versión?
+          DOCKERHUB_OK=true
+          if [ -n "${{ steps.image.outputs.dockerhub }}" ]; then
+            docker manifest inspect "${{ steps.image.outputs.dockerhub }}:$TARGET_VERSION" >/dev/null 2>&1 || DOCKERHUB_OK=false
+          fi
+
+          echo "ghcr latest=${PUBLISHED_LATEST_VERSION:-<none>} target=${PUBLISHED_TARGET_VERSION:-<none>} dockerhub_ok=$DOCKERHUB_OK"
+          echo "published_latest_version=$PUBLISHED_LATEST_VERSION" >> "$GITHUB_OUTPUT"
+          echo "published_target_version=$PUBLISHED_TARGET_VERSION" >> "$GITHUB_OUTPUT"
+          echo "dockerhub_ok=$DOCKERHUB_OK" >> "$GITHUB_OUTPUT"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          TARGET="${{ steps.release.outputs.version }}"
+          LATEST="${{ steps.current.outputs.published_latest_version }}"
+          TAGGED="${{ steps.current.outputs.published_target_version }}"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "Build forzado manualmente"
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          elif [ "$LATEST" != "$TARGET" ] || [ "$TAGGED" != "$TARGET" ] || [ "${{ steps.current.outputs.dockerhub_ok }}" != "true" ]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.needs_update == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Prepare
+        id: prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "platform_pair=${platform//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.check.outputs.image }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            OPENCODE_VERSION=${{ needs.check.outputs.version }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ needs.check.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v6
+        with:
+          name: digests-${{ steps.prepare.outputs.platform_pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [check, build]
+    if: needs.check.outputs.needs_update == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v7
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: needs.check.outputs.dockerhub_image != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create manifest list and push (GHCR)
+        working-directory: /tmp/digests
+        run: |
+          IMAGE="${{ needs.check.outputs.image }}"
+          docker buildx imagetools create \
+            -t "$IMAGE:${{ needs.check.outputs.version }}" \
+            -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Copy to Docker Hub
+        if: needs.check.outputs.dockerhub_image != ''
+        run: |
+          SRC="${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}"
+          DST="${{ needs.check.outputs.dockerhub_image }}"
+          docker buildx imagetools create \
+            -t "$DST:${{ needs.check.outputs.version }}" \
+            -t "$DST:latest" \
+            "$SRC"
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}"
+          if [ -n "${{ needs.check.outputs.dockerhub_image }}" ]; then
+            docker buildx imagetools inspect "${{ needs.check.outputs.dockerhub_image }}:${{ needs.check.outputs.version }}"
+          fi
